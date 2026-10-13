@@ -2,7 +2,7 @@ name: Codex Pilot native WSL2 installation
 
 on:
   push:
-    branches: [codex-pilot-native-check-*]
+    branches: [codex-pilot-wsl2-check-*]
   workflow_dispatch:
 
 permissions:
@@ -55,7 +55,6 @@ jobs:
             # A job must fail if that prerequisite or nested virtualization is unavailable.
             Invoke-WslLogged -Arguments @('--set-default-version', '2')
             Invoke-WslLogged -Arguments @('--install', '-d', $distribution, '--web-download', '--no-launch')
-            Invoke-WslLogged -Arguments @('--set-version', $distribution, '2')
             Invoke-WslLogged -Arguments @('--list', '--verbose')
 
             # Root plus an explicit command avoids the interactive first-user wizard.

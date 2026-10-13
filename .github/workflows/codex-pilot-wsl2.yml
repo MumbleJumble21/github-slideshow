@@ -1,0 +1,189 @@
+name: Codex Pilot native WSL2 installation
+
+on:
+  push:
+    branches: [codex-pilot-native-check-*]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CODEX_VERSION: "0.162.1"
+
+jobs:
+  native-wsl2:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out the disposable validation kit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Ubuntu and run native WSL2 installation checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $distribution = 'Ubuntu-24.04'
+          $kitWorkspace = Join-Path $env:GITHUB_WORKSPACE 'codex-native-check'
+          $evidence = Join-Path $kitWorkspace 'evidence/wsl2'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $setupLog = Join-Path $evidence 'setup.log'
+          $kernel = $null
+          $wsl2Verified = $false
+          $succeeded = $false
+          $linuxEvidence = $null
+          $failure = $null
+
+          function Invoke-WslLogged {
+            param([string[]]$Arguments)
+            Write-Host ('wsl.exe ' + ($Arguments -join ' '))
+            & wsl.exe @Arguments 2>&1 | Tee-Object -FilePath $setupLog -Append
+            if ($LASTEXITCODE -ne 0) {
+              throw "WSL command failed with exit code $LASTEXITCODE"
+            }
+          }
+
+          try {
+            [Environment]::OSVersion.VersionString | Tee-Object -FilePath $setupLog -Append
+            Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform |
+              Select-Object FeatureName, State | ConvertTo-Json |
+              Tee-Object -FilePath $setupLog -Append
+            Invoke-WslLogged -Arguments @('--version')
+            # windows-2025 already enables WSL2 and VirtualMachinePlatform in its image.
+            # A job must fail if that prerequisite or nested virtualization is unavailable.
+            Invoke-WslLogged -Arguments @('--set-default-version', '2')
+            Invoke-WslLogged -Arguments @('--install', '-d', $distribution, '--web-download', '--no-launch')
+            Invoke-WslLogged -Arguments @('--set-version', $distribution, '2')
+            Invoke-WslLogged -Arguments @('--list', '--verbose')
+
+            # Root plus an explicit command avoids the interactive first-user wizard.
+            $kernel = (& wsl.exe -d $distribution -u root -- uname -r | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to launch the installed WSL distribution: exit $LASTEXITCODE"
+            }
+            $kernel | Tee-Object -FilePath $setupLog -Append
+            if ($kernel -notmatch '(?i)microsoft-standard-WSL2') {
+              throw "The running kernel is not WSL2: $kernel"
+            }
+            $distributionList = ((& wsl.exe --list --verbose | Out-String) -replace "`0", '')
+            if ($LASTEXITCODE -ne 0 -or $distributionList -notmatch '(?m)Ubuntu-24\.04\s+\S+\s+2\s*$') {
+              throw "WSL did not report Ubuntu-24.04 as version 2: $distributionList"
+            }
+            $wsl2Verified = $true
+
+            $linuxWorkspace = (& wsl.exe -d $distribution -u root -- wslpath -u $kitWorkspace | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the workspace path in WSL' }
+            $linuxEvidence = (& wsl.exe -d $distribution -u root -- wslpath -u $evidence | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the evidence path in WSL' }
+            $scriptPath = Join-Path $env:RUNNER_TEMP 'codex-pilot-native-wsl2.sh'
+            $script = @'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source_root=$1
+          codex_version=$2
+          run_root=/root/codex-pilot-native-wsl2
+          kit_root="$run_root/kit"
+          evidence_root="$run_root/evidence"
+          mkdir -p "$kit_root/config" "$kit_root/project" "$evidence_root"
+          exec > >(tee -a "$evidence_root/linux-setup.log") 2>&1
+
+          uname -a
+          cat /etc/os-release
+          if [[ ! "$(uname -r)" =~ [Mm]icrosoft-standard-WSL2 ]]; then
+            echo 'Expected an actual WSL2 kernel' >&2
+            exit 1
+          fi
+          # Copy the exact test inputs only; do not copy .git or host credentials.
+          cp "$source_root/native-smoke.py" "$kit_root/native-smoke.py"
+          cp "$source_root/config/default.toml" "$kit_root/config/default.toml"
+          cp "$source_root/config/pilot.config.toml" "$kit_root/config/pilot.config.toml"
+          cp "$source_root/project/package.json" "$kit_root/project/package.json"
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl xz-utils python3
+          download_root="$run_root/node-download"
+          node_root="$run_root/node"
+          mkdir -p "$download_root" "$node_root"
+          cd "$download_root"
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 --max-time 180 \
+            https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt -o SHASUMS256.txt
+          node_archive=$(awk '$2 ~ /^node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$/ {print $2; exit}' SHASUMS256.txt)
+          if [[ -z "$node_archive" ]]; then
+            echo 'Cannot resolve the official Node 22 Linux x64 archive' >&2
+            exit 1
+          fi
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 --max-time 180 \
+            "https://nodejs.org/dist/latest-v22.x/$node_archive" -o "$node_archive"
+          awk -v archive="$node_archive" '$2 == archive' SHASUMS256.txt > selected-SHASUMS256.txt
+          sha256sum --check --strict selected-SHASUMS256.txt
+          tar -xJf "$node_archive" -C "$node_root" --strip-components=1
+          export PATH="$node_root/bin:$PATH"
+          node --version
+          npm --version
+          python3 --version
+
+          install_root="$run_root/npm installation with spaces"
+          npm install --prefix "$install_root" --registry=https://registry.npmjs.org \
+            --no-audit --no-fund "@openai/codex@$codex_version"
+          wrapper="$install_root/node_modules/@openai/codex/bin/codex.js"
+          cd "$kit_root"
+          python3 native-smoke.py --codex-js "$wrapper" --version "$codex_version" \
+            --output "$evidence_root/npm-install.json"
+          npm install --prefix "$install_root" --registry=https://registry.npmjs.org \
+            --no-audit --no-fund "@openai/codex@$codex_version"
+          python3 native-smoke.py --codex-js "$wrapper" --version "$codex_version" \
+            --output "$evidence_root/npm-reinstall.json"
+          python3 - "$evidence_root/platform.json" <<'PY'
+          import json, platform, sys
+          from pathlib import Path
+          Path(sys.argv[1]).write_text(json.dumps({
+              'platform': platform.system(),
+              'release': platform.release(),
+              'architecture': platform.machine(),
+              'wsl_version': 2,
+              'native_installation': True,
+              'scope': 'offline installation and configuration checks; no model requests',
+          }, indent=2) + '\n')
+          PY
+          '@
+            [IO.File]::WriteAllText($scriptPath, ($script -replace "`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+            $linuxScript = (& wsl.exe -d $distribution -u root -- wslpath -u $scriptPath | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the setup script path in WSL' }
+            Invoke-WslLogged -Arguments @('-d', $distribution, '-u', 'root', '--', 'bash', $linuxScript, $linuxWorkspace, $env:CODEX_VERSION)
+            $succeeded = $true
+          } catch {
+            $failure = $_.Exception.Message
+            $failure | Tee-Object -FilePath $setupLog -Append
+            throw
+          } finally {
+            if ($wsl2Verified -and $linuxEvidence) {
+              & wsl.exe -d $distribution -u root -- bash -c 'if [ -d /root/codex-pilot-native-wsl2/evidence ]; then cp -a /root/codex-pilot-native-wsl2/evidence/. "$1/"; fi' evidence-copy $linuxEvidence
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Copying WSL evidence failed with exit code $LASTEXITCODE"
+                $succeeded = $false
+              }
+            }
+            @{
+              platform = 'Windows WSL2'
+              distribution = $distribution
+              kernel = $kernel
+              wsl2_verified = $wsl2Verified
+              version = $env:CODEX_VERSION
+              passed = $succeeded
+              error = $failure
+              scope = 'native WSL2 npm install/reinstall and offline configuration checks; no model requests'
+            } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $evidence 'result.json')
+          }
+          if (-not $succeeded) { throw 'WSL2 validation did not complete successfully' }
+
+      - name: Upload WSL2 installation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-pilot-native-wsl2-evidence
+          path: codex-native-check/evidence/wsl2
+          if-no-files-found: warn
+          retention-days: 7

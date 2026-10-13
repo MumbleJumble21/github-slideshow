@@ -1,0 +1,6 @@
+npm-install/
+codex-pilot-smoke-*/
+__pycache__/
+evidence/*
+!evidence/install.sh
+!evidence/install.ps1

@@ -1,0 +1,6 @@
+[features]
+shell_snapshot = true
+
+[mcp_servers.pilot-overlay]
+command = "node"
+args = ["--version"]

@@ -1,0 +1,199 @@
+name: Codex installation and configuration smoke checks
+
+on:
+  push:
+    branches: [codex-pilot-native-check-*]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PILOT_ROOT: ${{ github.workspace }}/codex-native-check
+
+defaults:
+  run:
+    working-directory: codex-native-check
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.install }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        install: [npm, standalone]
+    runs-on: ${{ matrix.os }}
+    env:
+      CODEX_VERSION: '0.162.1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install and reinstall pinned npm package
+        if: ${{ matrix.install == 'npm' }}
+        id: npm
+        shell: python {0}
+        run: |
+          import json, os, platform, shutil, subprocess
+          from pathlib import Path
+          root = Path(os.environ['PILOT_ROOT'])
+          evidence = root / 'evidence'
+          evidence.mkdir(exist_ok=True)
+          installation = Path(os.environ['RUNNER_TEMP']) / 'npm installation with spaces'
+          version = os.environ['CODEX_VERSION']
+          command = [shutil.which('npm'), 'install', '--prefix', str(installation),
+                     '--no-audit', '--no-fund', '--save-exact', '@openai/codex@' + version]
+          checks = []
+          for label in ('install', 'reinstall'):
+              result = subprocess.run(command, capture_output=True, text=True,
+                                      encoding='utf-8', errors='replace', timeout=600)
+              (evidence / ('ci-npm-' + label + '.log')).write_text(
+                  result.stdout + result.stderr, encoding='utf-8')
+              checks.append({'name': label, 'passed': result.returncode == 0,
+                             'exit_code': result.returncode})
+              print(label + ': ' + str(result.returncode), flush=True)
+              if result.returncode:
+                  break
+          launcher = installation / 'node_modules/@openai/codex/bin/codex.js'
+          checks.append({'name': 'npm launcher installed', 'passed': launcher.is_file()})
+          passed = all(check['passed'] for check in checks)
+          report = {'platform': platform.system(), 'architecture': platform.machine(),
+                    'kernel': platform.release(), 'version': version, 'checks': checks,
+                    'passed': passed, 'launcher': str(launcher)}
+          (evidence / 'ci-npm-install.json').write_text(json.dumps(report, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('launcher=' + str(launcher) + '\n')
+          raise SystemExit(0 if passed else 1)
+
+      - name: Install and reinstall using official native installer
+        if: ${{ matrix.install == 'standalone' }}
+        id: standalone
+        shell: python {0}
+        run: |
+          import hashlib, json, os, platform, shutil, subprocess
+          from pathlib import Path
+          root = Path(os.environ['PILOT_ROOT'])
+          evidence = root / 'evidence'
+          evidence.mkdir(exist_ok=True)
+          installation = Path(os.environ['RUNNER_TEMP']) / 'standalone installation with spaces'
+          bin_directory = installation / 'bin'
+          config_directory = installation / 'codex-config'
+          config_directory.mkdir(parents=True, exist_ok=True)
+          version = os.environ['CODEX_VERSION']
+          windows = os.name == 'nt'
+          binary = bin_directory / ('codex.exe' if windows else 'codex')
+          environment = os.environ.copy()
+          environment['CODEX_HOME'] = str(config_directory)
+          environment['CODEX_INSTALL_DIR'] = str(bin_directory)
+          environment['CODEX_NON_INTERACTIVE'] = '1'
+          # Exclude unrelated installs so the official installer cannot offer
+          # to remove them or rewrite shell profiles to resolve a PATH conflict.
+          codex_names = ('codex', 'codex.exe', 'codex.cmd', 'codex.bat')
+          utility_paths = [entry for entry in environment['PATH'].split(os.pathsep)
+                           if entry and not any((Path(entry) / name).is_file()
+                                                for name in codex_names)]
+          environment['PATH'] = os.pathsep.join([str(bin_directory), *utility_paths])
+          installer = evidence / ('install.ps1' if windows else 'install.sh')
+          command = ([shutil.which('powershell.exe'), '-NoProfile', '-NonInteractive',
+                      '-ExecutionPolicy', 'Bypass', '-File', str(installer), '-Release', version]
+                     if windows else [shutil.which('sh'), str(installer), '--release', version])
+          profiles = [Path.home() / name for name in
+                      ('.bashrc', '.bash_profile', '.profile', '.zshrc', '.zprofile')]
+          for directory in ('PowerShell', 'WindowsPowerShell'):
+              profiles.extend(Path.home() / 'Documents' / directory / name for name in
+                              ('profile.ps1', 'Microsoft.PowerShell_profile.ps1'))
+          def profile_digests():
+              return {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                      if path.is_file() else None for path in profiles}
+          before = profile_digests()
+          # The Windows installer registers its bin directory in User PATH.
+          # Verify this behavior, then restore the disposable runner's value.
+          if windows:
+              import winreg
+              with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment') as key:
+                  try:
+                      original_path, original_type = winreg.QueryValueEx(key, 'Path')
+                  except FileNotFoundError:
+                      original_path, original_type = None, winreg.REG_EXPAND_SZ
+          checks = []
+          try:
+              for label in ('install', 'reinstall'):
+                  result = subprocess.run(command, env=environment, capture_output=True,
+                                          text=True, encoding='utf-8', errors='replace', timeout=600)
+                  (evidence / ('ci-standalone-' + label + '.log')).write_text(
+                      result.stdout + result.stderr, encoding='utf-8')
+                  checks.append({'name': label, 'passed': result.returncode == 0,
+                                 'exit_code': result.returncode})
+                  print(label + ': ' + str(result.returncode), flush=True)
+                  if result.returncode:
+                      break
+              if windows:
+                  with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment') as key:
+                      installed_path, _ = winreg.QueryValueEx(key, 'Path')
+                  checks.append({'name': 'installer registers native bin in User PATH',
+                                 'passed': str(bin_directory).casefold() in
+                                 [entry.casefold() for entry in installed_path.split(';')]})
+          finally:
+              if windows:
+                  with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0,
+                                      winreg.KEY_SET_VALUE) as key:
+                      if original_path is None:
+                          try:
+                              winreg.DeleteValue(key, 'Path')
+                          except FileNotFoundError:
+                              pass
+                      else:
+                          winreg.SetValueEx(key, 'Path', 0, original_type, original_path)
+          checks.extend([
+              {'name': 'shell profiles preserved', 'passed': before == profile_digests()},
+              {'name': 'standalone executable installed', 'passed': binary.is_file()},
+          ])
+          passed = all(check['passed'] for check in checks)
+          report = {'platform': platform.system(), 'architecture': platform.machine(),
+                    'kernel': platform.release(), 'version': version, 'checks': checks,
+                    'passed': passed, 'binary': str(binary),
+                    'installer_sha256': hashlib.sha256(installer.read_bytes()).hexdigest()}
+          (evidence / 'ci-standalone-install.json').write_text(json.dumps(report, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('binary=' + str(binary) + '\n')
+          raise SystemExit(0 if passed else 1)
+
+      - name: Check installed npm CLI configuration
+        if: ${{ matrix.install == 'npm' }}
+        shell: python {0}
+        env:
+          CODEX_LAUNCHER: ${{ steps.npm.outputs.launcher }}
+        run: |
+          import os, subprocess, sys
+          raise SystemExit(subprocess.call([
+              sys.executable, 'native-smoke.py', '--codex-js', os.environ['CODEX_LAUNCHER'],
+              '--version', os.environ['CODEX_VERSION'], '--output', 'evidence/ci-smoke.json']))
+
+      - name: Check installed standalone CLI configuration
+        if: ${{ matrix.install == 'standalone' }}
+        shell: python {0}
+        env:
+          CODEX_BINARY: ${{ steps.standalone.outputs.binary }}
+        run: |
+          import os, subprocess, sys
+          raise SystemExit(subprocess.call([
+              sys.executable, 'native-smoke.py', '--binary', os.environ['CODEX_BINARY'],
+              '--version', os.environ['CODEX_VERSION'], '--output', 'evidence/ci-smoke.json']))
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codex-smoke-${{ matrix.os }}-${{ matrix.install }}
+          path: |
+            codex-native-check/evidence/ci-*.json
+            codex-native-check/evidence/ci-*.log
+          if-no-files-found: warn
+

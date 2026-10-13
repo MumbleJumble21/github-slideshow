@@ -1,0 +1,8 @@
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+web_search = "disabled"
+cli_auth_credentials_store = "file"
+check_for_update_on_startup = false
+
+[features]
+shell_snapshot = false

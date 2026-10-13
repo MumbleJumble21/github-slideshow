@@ -58,7 +58,7 @@ jobs:
             Invoke-WslLogged -Arguments @('--list', '--verbose')
 
             # Root plus an explicit command avoids the interactive first-user wizard.
-            $kernel = (& wsl.exe -d $distribution -u root -- uname -r | Out-String).Trim()
+            $kernel = (& wsl.exe -d $distribution -u root --exec uname -r | Out-String).Trim()
             if ($LASTEXITCODE -ne 0) {
               throw "Unable to launch the installed WSL distribution: exit $LASTEXITCODE"
             }
@@ -72,9 +72,9 @@ jobs:
             }
             $wsl2Verified = $true
 
-            $linuxWorkspace = (& wsl.exe -d $distribution -u root -- wslpath -u $kitWorkspace | Out-String).Trim()
+            $linuxWorkspace = (& wsl.exe -d $distribution -u root --exec wslpath -u $kitWorkspace | Out-String).Trim()
             if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the workspace path in WSL' }
-            $linuxEvidence = (& wsl.exe -d $distribution -u root -- wslpath -u $evidence | Out-String).Trim()
+            $linuxEvidence = (& wsl.exe -d $distribution -u root --exec wslpath -u $evidence | Out-String).Trim()
             if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the evidence path in WSL' }
             $scriptPath = Join-Path $env:RUNNER_TEMP 'codex-pilot-native-wsl2.sh'
             $script = @'
@@ -149,9 +149,9 @@ jobs:
           PY
           '@
             [IO.File]::WriteAllText($scriptPath, ($script -replace "`r`n", "`n"), [Text.UTF8Encoding]::new($false))
-            $linuxScript = (& wsl.exe -d $distribution -u root -- wslpath -u $scriptPath | Out-String).Trim()
+            $linuxScript = (& wsl.exe -d $distribution -u root --exec wslpath -u $scriptPath | Out-String).Trim()
             if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the setup script path in WSL' }
-            Invoke-WslLogged -Arguments @('-d', $distribution, '-u', 'root', '--', 'bash', $linuxScript, $linuxWorkspace, $env:CODEX_VERSION)
+            Invoke-WslLogged -Arguments @('-d', $distribution, '-u', 'root', '--exec', 'bash', $linuxScript, $linuxWorkspace, $env:CODEX_VERSION)
             $succeeded = $true
           } catch {
             $failure = $_.Exception.Message
@@ -159,7 +159,7 @@ jobs:
             throw
           } finally {
             if ($wsl2Verified -and $linuxEvidence) {
-              & wsl.exe -d $distribution -u root -- bash -c 'if [ -d /root/codex-pilot-native-wsl2/evidence ]; then cp -a /root/codex-pilot-native-wsl2/evidence/. "$1/"; fi' evidence-copy $linuxEvidence
+              & wsl.exe -d $distribution -u root --exec bash -c 'if [ -d /root/codex-pilot-native-wsl2/evidence ]; then cp -a /root/codex-pilot-native-wsl2/evidence/. "$1/"; fi' evidence-copy $linuxEvidence
               if ($LASTEXITCODE -ne 0) {
                 Write-Warning "Copying WSL evidence failed with exit code $LASTEXITCODE"
                 $succeeded = $false

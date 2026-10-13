@@ -1,0 +1,173 @@
+name: Native Codex ChatGPT account sign-in
+
+on:
+  push:
+    branches: [codex-pilot-account-login-*]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CODEX_VERSION: '0.162.1'
+  PILOT_ROOT: ${{ github.workspace }}/codex-native-check
+
+jobs:
+  native-account:
+    name: ChatGPT sign-in / ${{ matrix.platform }}
+    timeout-minutes: 22
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            platform: windows
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    env:
+      ACCOUNT_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CLI and start private device sign-in
+        shell: python {0}
+        run: |
+          import os, shutil, subprocess
+          from pathlib import Path
+          kit = Path(os.environ['PILOT_ROOT'])
+          temporary = Path(os.environ['RUNNER_TEMP']) / 'codex account login'
+          installation = temporary / 'npm-install'
+          subprocess.run([shutil.which('npm'), 'install', '--prefix', str(installation),
+                          '--no-audit', '--no-fund', '@openai/codex@' + os.environ['CODEX_VERSION']], check=True)
+          arguments = [shutil.which('node'), str(kit / 'account-login.mjs'), 'start',
+                       '--platform', os.environ['ACCOUNT_PLATFORM'],
+                       '--codex-js', str(installation / 'node_modules/@openai/codex/bin/codex.js'),
+                       '--root', str(temporary / 'private-auth'),
+                       '--public-key', str(kit / 'account-login-public.pem'),
+                       '--evidence', str(kit / 'evidence/account-login')]
+          subprocess.run(arguments, check=True)
+      - name: Publish encrypted browser handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: account-device-${{ matrix.platform }}
+          path: codex-native-check/evidence/account-login/${{ matrix.platform }}/device-login-encrypted.json
+          retention-days: 1
+      - name: Wait for browser approval and verify ChatGPT sign-in
+        shell: python {0}
+        run: |
+          import os, shutil, subprocess
+          from pathlib import Path
+          kit = Path(os.environ['PILOT_ROOT'])
+          temporary = Path(os.environ['RUNNER_TEMP']) / 'codex account login'
+          subprocess.run([shutil.which('node'), str(kit / 'account-login.mjs'), 'wait',
+                          '--platform', os.environ['ACCOUNT_PLATFORM'],
+                          '--codex-js', str(temporary / 'npm-install/node_modules/@openai/codex/bin/codex.js'),
+                          '--root', str(temporary / 'private-auth'),
+                          '--public-key', str(kit / 'account-login-public.pem'),
+                          '--evidence', str(kit / 'evidence/account-login')], check=True)
+      - name: Publish redacted sign-in result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: account-result-${{ matrix.platform }}
+          path: codex-native-check/evidence/account-login/${{ matrix.platform }}/account-login-result.json
+          retention-days: 1
+          if-no-files-found: warn
+
+  wsl-account:
+    name: ChatGPT sign-in / WSL2
+    runs-on: windows-2025
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare WSL2 and start private device sign-in
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $distribution = 'Ubuntu-24.04'
+          & wsl.exe --set-default-version 2
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select WSL2' }
+          & wsl.exe --install -d $distribution --web-download --no-launch
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot install Ubuntu' }
+          $kernel = (& wsl.exe -d $distribution -u root --exec uname -r | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $kernel -notmatch '(?i)microsoft-standard-WSL2') {
+            throw 'Actual WSL2 kernel was not confirmed'
+          }
+          $kernel
+          $kitPath = (& wsl.exe -d $distribution -u root --exec wslpath -u $env:PILOT_ROOT | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve WSL kit path' }
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'codex-account-wsl.sh'
+          $script = @'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          source_root=$1
+          run_root=/root/codex-account-login
+          mkdir -p "$run_root/kit" "$run_root/evidence"
+          cp "$source_root/account-login.mjs" "$run_root/kit/"
+          cp "$source_root/account-login-public.pem" "$run_root/kit/"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl xz-utils
+          mkdir -p "$run_root/node-download" "$run_root/node"
+          cd "$run_root/node-download"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 180 https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt -o SHASUMS256.txt
+          node_archive=$(awk '$2 ~ /^node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$/ {print $2; exit}' SHASUMS256.txt)
+          test -n "$node_archive"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 180 "https://nodejs.org/dist/latest-v22.x/$node_archive" -o "$node_archive"
+          awk -v archive="$node_archive" '$2 == archive' SHASUMS256.txt > selected-SHASUMS256.txt
+          sha256sum --check --strict selected-SHASUMS256.txt
+          tar -xJf "$node_archive" -C "$run_root/node" --strip-components=1
+          export PATH="$run_root/node/bin:$PATH"
+          npm install --prefix "$run_root/npm-install" --no-audit --no-fund @openai/codex@0.162.1
+          node "$run_root/kit/account-login.mjs" start --platform wsl2 \
+            --codex-js "$run_root/npm-install/node_modules/@openai/codex/bin/codex.js" \
+            --root "$run_root/private-auth" --public-key "$run_root/kit/account-login-public.pem" \
+            --evidence "$run_root/evidence"
+          mkdir -p "$source_root/evidence/account-login/wsl2"
+          cp "$run_root/evidence/wsl2/device-login-encrypted.json" "$source_root/evidence/account-login/wsl2/"
+          '@
+          [IO.File]::WriteAllText($scriptPath, ($script -replace "`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+          $linuxScript = (& wsl.exe -d $distribution -u root --exec wslpath -u $scriptPath | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve WSL script path' }
+          & wsl.exe -d $distribution -u root --exec bash $linuxScript $kitPath
+          if ($LASTEXITCODE -ne 0) { throw 'Private WSL account sign-in setup failed' }
+      - name: Publish encrypted browser handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: account-device-wsl2
+          path: codex-native-check/evidence/account-login/wsl2/device-login-encrypted.json
+          retention-days: 1
+      - name: Wait for browser approval and verify ChatGPT sign-in
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kitPath = (& wsl.exe -d Ubuntu-24.04 -u root --exec wslpath -u $env:PILOT_ROOT | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve WSL kit path' }
+          & wsl.exe -d Ubuntu-24.04 -u root --exec /root/codex-account-login/node/bin/node `
+            /root/codex-account-login/kit/account-login.mjs wait --platform wsl2 `
+            --codex-js /root/codex-account-login/npm-install/node_modules/@openai/codex/bin/codex.js `
+            --root /root/codex-account-login/private-auth `
+            --public-key /root/codex-account-login/kit/account-login-public.pem `
+            --evidence /root/codex-account-login/evidence
+          $loginExit = $LASTEXITCODE
+          & wsl.exe -d Ubuntu-24.04 -u root --exec bash -c 'cp /root/codex-account-login/evidence/wsl2/account-login-result.json "$1/evidence/account-login/wsl2/"' copy-result $kitPath
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot collect redacted WSL account result' }
+          if ($loginExit -ne 0) { throw 'WSL account sign-in did not pass' }
+      - name: Publish redacted sign-in result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: account-result-wsl2
+          path: codex-native-check/evidence/account-login/wsl2/account-login-result.json
+          retention-days: 1
+          if-no-files-found: warn
